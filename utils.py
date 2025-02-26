@@ -2,7 +2,6 @@ import torch as th
 # import numpy as np
 from math import pi as π
 import math
-from numpy.random import uniform as uni
 from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt; plt.style.use('dark_background')
@@ -64,11 +63,11 @@ def soft_quantize(x, levels, temperature=0.1):
     soft_assignment = soft_assignment.reshape(*x_shape,len(levels))
     return soft_quantized, soft_assignment
 
-def entropy(x):
+def entropy(x, eps=1e-10):
+    x = x.flatten()
     _, counts = th.unique(x, return_counts=True)
     p = counts/len(x)
-    # return -th.sum(p*th.log2(p))
-    return -th.sum(p*th.log(p))
+    return -th.sum((p+eps)*th.log(p+eps))
 
 def create_random_signal(n_samples, n_frqs=2):
     # generate random frequencies
@@ -156,13 +155,10 @@ class HLoss1(nn.Module): # https://en.wikipedia.org/wiki/Kernel_density_estimati
 class HLoss2(nn.Module): # by claude 3.7: prompt: write a pytorch module/loss that calculates the entropy of a quantized signal, make sure the entropy loss is differentiable and can be backprop. The signal is a N timesteps window (shape (batch_size,N,1)), the quantization step is epsilon. Note that the quantization is in the values of the signals, not the time. 
     """
     Calculates the entropy of a quantized signal in a differentiable manner.
-
     The signal is quantized with a step size of epsilon, and the entropy is calculated
     based on the probability distribution of the quantized values.
-    
     To maintain differentiability, soft quantization is used with a temperature parameter
     that controls the smoothness of the quantization.
-    
     Args:
         epsilon (float): The quantization step size
         min_val (float, optional): Minimum value for quantization range. Default: -1.0
