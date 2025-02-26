@@ -44,7 +44,7 @@ class HLoss1(nn.Module): # https://discuss.pyth.org/t/calculating-the-entropy-lo
         self.nlevels = int(2*max / ε)//2+1 
 
     def forward(self, x1, x2=None):
-        r = x1 - x2 if x2 is not None else x1
+        r = x1 if x2 is None else x1 - x2
         rq = quantize(r, self.ε, self.max)
 
         # convert to 1-hot encoding
@@ -55,50 +55,89 @@ class HLoss1(nn.Module): # https://discuss.pyth.org/t/calculating-the-entropy-lo
         b = -1.0 * b.sum() / rq.size(0)
         return b
     
-# v2: https://en.wikipedia.org/wiki/Kernel_density_estimation, kinda working, no quantization
+# # v2: https://en.wikipedia.org/wiki/Kernel_density_estimation, kinda working, no quantization
+'''# class HLoss2(nn.Module): # https://en.wikipedia.org/wiki/Kernel_density_estimation
+#     def __init__(self, ε, max):
+#         super(HLoss2, self).__init__()
+#         self.ε, self.max = ε, max
+#         # self.nlevels = int(2*max / ε)//2+1 
+#     def forward(self, x1, x2=None):
+#         r = x1 if x2 is None else x1 - x2
+#         # rq = quantize(r, self.ε, self.max) # no quantization -> no grad
+
+#         rqs = r
+#         ents = 0
+#         for rq in rqs:
+#             σ = 1*self.ε # width of the gaussian kernel
+#             # sample m points from a gaussian
+#             m = 300
+#             μrq, σrq = th.mean(rq), th.std(rq) # mean and std of the quantized signal
+#             samples = th.randn(m) * σrq + μrq # samples from the gaussian
+#             likelihoods = normal(samples, μrq, σrq) # likelihoods
+#             # Reshape samples to [m, 1] to broadcast against rq
+#             samples_reshaped = samples.reshape(-1, 1)
+#             # Calculate normal probability for each sample-rq pair
+#             probs = normal(samples_reshaped, rq, σ)  # Shape: [m, len(rq)]
+#             # Mean across rq dimension
+#             p_values = th.mean(probs, dim=1)  # Shape: [m]
+#             # Calculate entropy contribution for each sample
+#             log_terms = -p_values * th.log(p_values + 1e-8)
+#             # Divide by likelihoods and sum
+#             ent = th.sum(log_terms / likelihoods)
+#             ents += ent/m
+#         return ents / len(rq)
+'''
 class HLoss2(nn.Module): # https://en.wikipedia.org/wiki/Kernel_density_estimation
     def __init__(self, ε, max):
         super(HLoss2, self).__init__()
         self.ε, self.max = ε, max
         # self.nlevels = int(2*max / ε)//2+1 
     def forward(self, x1, x2=None):
-        r = x1 - x2 if x2 is not None else x1
-        # rq = quantize(r, self.ε, self.max) # no quantization -> no grad
-        rq = r
-
+        r = x1 if x2 is None else x1 - x2
+        
+        # Get batch size
+        batch_size = r.shape[0]
         σ = 1*self.ε # width of the gaussian kernel
-        # sample m points from a gaussian
-        m = 300
-        μrq, σrq = th.mean(rq), th.std(rq) # mean and std of the quantized signal
-        samples = th.randn(m) * σrq + μrq # samples from the gaussian
-        likelihoods = normal(samples, μrq, σrq) # likelihoods
+        m = 500
         
-        # Calculate pdf of the quantized signal
-        ent1 = 0 # TODO: vectorize this shit
-        for s,l in zip(samples, likelihoods):
-            p = th.mean(normal(s, rq, σ))
-            ent1 += -p*th.log(p+1e-8) / l
-
-        # Vectorized implementation
-        # Reshape samples to [m, 1] to broadcast against rq
-        samples_reshaped = samples.reshape(-1, 1)
-        # Calculate normal probability for each sample-rq pair
-        probs = normal(samples_reshaped, rq, σ)  # Shape: [m, len(rq)]
-        # Mean across rq dimension
-        p_values = th.mean(probs, dim=1)  # Shape: [m]
-        # Calculate entropy contribution for each sample
+        # Compute statistics for each item in batch
+        μrqs = th.mean(r, dim=1)  # [batch_size]
+        σrqs = th.std(r, dim=1)   # [batch_size]
+        
+        # Create samples for each item in batch - shape [batch_size, m]
+        # We use expand instead of repeat to avoid copying data
+        batch_randn = th.randn(batch_size, m, device=r.device)
+        samples = batch_randn * σrqs.unsqueeze(1) + μrqs.unsqueeze(1)
+        
+        # Calculate likelihoods - shape [batch_size, m]
+        # Creating a broadcasting-friendly version of μrqs and σrqs
+        μrqs_expanded = μrqs.unsqueeze(1)  # [batch_size, 1]
+        σrqs_expanded = σrqs.unsqueeze(1)  # [batch_size, 1]
+        likelihoods = normal(samples, μrqs_expanded, σrqs_expanded)
+        
+        # For each batch item and each sample, calculate probability
+        # Reshape r to [batch_size, 1, seq_len] and samples to [batch_size, m, 1]
+        r_expanded = r.unsqueeze(1)  # [batch_size, 1, seq_len]
+        samples_expanded = samples.unsqueeze(2)  # [batch_size, m, 1]
+        
+        # Calculate probabilities - shape [batch_size, m, seq_len]
+        probs = normal(samples_expanded, r_expanded, σ)
+        
+        # Mean across sequence dimension - shape [batch_size, m]
+        p_values = th.mean(probs, dim=2)
+        
+        # Calculate entropy contribution - shape [batch_size, m]
         log_terms = -p_values * th.log(p_values + 1e-8)
-        # Divide by likelihoods and sum
-        ent2 = th.sum(log_terms / likelihoods)
         
-        assert th.allclose(ent1, ent2)
+        # Divide by likelihoods and sum for each batch item - shape [batch_size]
+        ents = th.sum(log_terms / likelihoods, dim=1) / m
+        
+        # Return average entropy across batch
+        return th.mean(ents)
 
-        # Use the vectorized version
-        ent = ent2
         
-        return ent/m
     
-class Hloss3(nn.Module): # by claude 3.7: prompt: write a pytorch module/loss that calculates the entropy of a quantized signal, make sure the entropy loss is differentiable and can be backprop. The signal is a N timesteps window (shape (batch_size,N,1)), the quantization step is epsilon. Note that the quantization is in the values of the signals, not the time. 
+class HLoss3(nn.Module): # by claude 3.7: prompt: write a pytorch module/loss that calculates the entropy of a quantized signal, make sure the entropy loss is differentiable and can be backprop. The signal is a N timesteps window (shape (batch_size,N,1)), the quantization step is epsilon. Note that the quantization is in the values of the signals, not the time. 
     """
     Calculates the entropy of a quantized signal in a differentiable manner.
 
@@ -116,27 +155,26 @@ class Hloss3(nn.Module): # by claude 3.7: prompt: write a pytorch module/loss th
             approach hard quantization. Default: 0.1
         eps (float, optional): Small value to avoid log(0). Default: 1e-10
     """
-    def __init__(self, epsilon, min_val=-1.0, max_val=1.0, temperature=0.1, eps=1e-10):
+    def __init__(self, ε, max_val=1.0, temperature=0.1, eps=1e-10):
         super().__init__()
-        self.epsilon = epsilon
-        self.min_val = min_val
+        self.ε = ε
         self.max_val = max_val
         self.temperature = temperature
         self.eps = eps
         
         # Calculate the number of quantization levels
-        self.num_levels = int((max_val - min_val) / epsilon) + 1
+        self.num_levels = int(2*max_val / ε)//2 + 1 # int(2*MAX_SIG / EPSI)//2+1
         
         # Create quantization centers
-        # self.register_buffer('centers', th.arange(min_val, max_val + epsilon, epsilon))
-        self.centers = th.arange(min_val, max_val + epsilon, epsilon, requires_grad=False)
+        # self.register_buffer('centers', th.arange(min_val, max_val + ε, ε))
+        self.centers = th.arange(-max_val, max_val, 2*ε, requires_grad=False)
     
     def soft_quantize(self, x):
         """
         Performs soft quantization using a differentiable approach.
         
         Args:
-            x (th.Tensor): Input signal of shape (batch_size, N, 1)
+            x (torch.Tensor): Input signal of shape (batch_size, N, )
             
         Returns:
             tuple: (soft_quantized_signal, soft_assignment)
@@ -144,7 +182,7 @@ class Hloss3(nn.Module): # by claude 3.7: prompt: write a pytorch module/loss th
                 - soft_assignment: The soft assignment to each quantization level
         """
         # Reshape x to (batch_size * N, 1)
-        batch_size, timesteps, _ = x.shape
+        x_shape = x.shape
         x_flat = x.reshape(-1, 1)  # (batch_size * N, 1)
         
         # Calculate distance to each quantization center
@@ -159,8 +197,8 @@ class Hloss3(nn.Module): # by claude 3.7: prompt: write a pytorch module/loss th
         soft_quantized = th.matmul(soft_assignment, self.centers.unsqueeze(1))
         
         # Reshape back to original shape
-        soft_quantized = soft_quantized.reshape(batch_size, timesteps, 1)
-        soft_assignment = soft_assignment.reshape(batch_size, timesteps, -1)
+        soft_quantized = soft_quantized.reshape(*x_shape)
+        soft_assignment = soft_assignment.reshape(*x_shape, self.num_levels)
         
         return soft_quantized, soft_assignment
     
@@ -175,7 +213,7 @@ class Hloss3(nn.Module): # by claude 3.7: prompt: write a pytorch module/loss th
             th.Tensor: The entropy loss (scalar)
         """        
 
-        r = x1 - x2 if x2 is not None else x1
+        r = x1 if x2 is None else x1 - x2
 
         # Get soft assignments to quantization levels
         _, soft_assignment = self.soft_quantize(r)  # (batch_size, timesteps, num_levels)
